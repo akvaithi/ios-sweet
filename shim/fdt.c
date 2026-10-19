@@ -82,3 +82,47 @@ int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
 		}
 	}
 }
+
+/* Collect (base, size) pairs from every top-level memory* node's reg (2+2 cells). */
+int fdt_memory(uintptr_t fdt, uint64_t *out, int max)
+{
+	if (!fdt || be32(fdt) != FDT_MAGIC)
+		return 0;
+	uintptr_t p = fdt + be32(fdt + 8);
+	uintptr_t strings = fdt + be32(fdt + 12);
+	int depth = 0, in_mem = 0, n = 0;
+
+	for (;;) {
+		uint32_t tok = be32(p);
+		p += 4;
+		switch (tok) {
+		case FDT_BEGIN_NODE: {
+			const char *name = (const char *)p;
+			depth++;
+			in_mem = depth == 2 && name[0] == 'm' && name[1] == 'e' && name[2] == 'm' &&
+				 name[3] == 'o' && name[4] == 'r' && name[5] == 'y';
+			p = align4(skip_str(p));
+			break;
+		}
+		case FDT_END_NODE:
+			in_mem = 0;
+			depth--;
+			break;
+		case FDT_PROP: {
+			uint32_t len = be32(p), nameoff = be32(p + 4);
+			uintptr_t val = p + 8;
+			if (in_mem && streq((const char *)(strings + nameoff), "reg"))
+				for (uint32_t o = 0; o + 16 <= len && n + 2 <= max; o += 16) {
+					out[n++] = (uint64_t)be32(val + o) << 32 | be32(val + o + 4);
+					out[n++] = (uint64_t)be32(val + o + 8) << 32 | be32(val + o + 12);
+				}
+			p = align4(val + len);
+			break;
+		}
+		case FDT_NOP:
+			break;
+		default:
+			return n / 2;
+		}
+	}
+}

@@ -76,6 +76,50 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+static uint32_t rd_le32_bytes(uintptr_t a)
+{
+	volatile const uint8_t *b = (volatile const uint8_t *)a;
+	return b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24;
+}
+
+static void copy8(uintptr_t dst, uintptr_t src, uint64_t n)
+{
+	volatile uint8_t *d = (volatile uint8_t *)dst;
+	volatile const uint8_t *s = (volatile const uint8_t *)src;
+	for (uint64_t i = 0; i < n; i++)
+		d[i] = s[i];
+}
+
+/*
+ * barbet: ABL builds the initrd from vendor_boot's ramdisk followed by
+ * ours, and the vendor ramdisk size is not a multiple of 8. Find the
+ * payload by its magic and move it down to the (aligned) initrd start.
+ * Byte accesses only until it is aligned: the MMU is off (Device memory).
+ */
+static uintptr_t find_payload(uintptr_t lo, uintptr_t hi)
+{
+	uintptr_t at = 0;
+	for (uintptr_t a = lo; a + 8 <= hi; a++)
+		if (magic_ok((const char *)a)) {
+			at = a;
+			break;
+		}
+	if (!at || at == lo)
+		return at;
+	uint32_t nsegs = rd_le32_bytes(at + 0xc);
+	uint64_t hdr = 0x2a8 + (uint64_t)nsegs * sizeof(struct payload_seg);
+	copy8(lo, at, hdr);
+	const struct payload *p = (const struct payload *)lo;
+	uint64_t len = p->adt_off + p->adt_size;
+	for (uint32_t i = 0; i < p->nsegs; i++)
+		if (p->segs[i].file_off + p->segs[i].file_size > len)
+			len = p->segs[i].file_off + p->segs[i].file_size;
+	len = (len + 7) & ~7UL;	/* copy64() reads whole words */
+	con_hex2("PAYLOAD", "at=", at, "len=", len);
+	copy8(lo + hdr, at + hdr, len - hdr);	/* dst < src: a forward copy is safe */
+	return lo;
+}
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
@@ -85,9 +129,10 @@ const char *loader_boot(uintptr_t dtb)
 		return "no initrd in /chosen";
 	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 
-	const struct payload *p = (const struct payload *)rd_start;
-	if (!magic_ok(p->magic))
+	rd_start = find_payload(rd_start, rd_end);
+	if (!rd_start)
 		return "no SWEETXNU payload";
+	const struct payload *p = (const struct payload *)rd_start;
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 

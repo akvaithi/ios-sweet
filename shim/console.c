@@ -5,7 +5,8 @@
 #include "console.h"
 #include "font.h"
 
-#define SCALE		3
+static int scale = 3;
+#define SCALE		scale
 #define CH_W		(8 * SCALE)
 #define CH_H		(16 * SCALE)
 #define MARGIN		24
@@ -93,5 +94,28 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 		fmt_hex(buf, vb, 8);
 		put_str(col, buf, WHITE);
 	}
+	row++;
+}
+
+void con_scale(int s)
+{
+	scale = s;
+}
+
+int con_cols(void)
+{
+	return (FB_W - 2 * MARGIN) / CH_W;
+}
+
+int con_rows(void)
+{
+	return (FB_H - 2 * MARGIN) / CH_H;
+}
+
+/* One raw text row at column 0 (n chars, no label). */
+void con_raw(const char *s, int n)
+{
+	for (int i = 0; i < n; i++)
+		put_char(i, s[i], WHITE);
 	row++;
 }

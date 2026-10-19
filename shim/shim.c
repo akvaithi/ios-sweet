@@ -11,13 +11,15 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "board.h"
+#include "fdt.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
+#define IMEM_RESTART_REASON	BOARD_IMEM_RESTART	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
+#define PSHOLD			BOARD_PSHOLD
 
-#define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
+#define GICD_BASE		BOARD_GICD
+#define GICR_BASE		BOARD_GICR
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -370,27 +372,80 @@ static uint32_t to_us(uint64_t ticks)
 	return ticks * 10 / 192;	/* 19.2 MHz */
 }
 
+
+#ifdef LOGDUMP
+/*
+ * Kernel console ring (xnu patch 0047, boot-arg sweetlog=1) left in DRAM by
+ * a hung boot: DDR survives the warm reset. LOGDUMP_RING/_TOTAL are the
+ * physical addresses of _sweet_log_ring/_sweet_log_total for that kernel.
+ */
+#define RING_SIZE	(4u << 20)
+
+static void dump_ring(void)
+{
+	static char tail[6000];
+	static int starts[400], lens[400];
+	uint64_t total = rd64(LOGDUMP_TOTAL);
+	uint32_t n = total < sizeof(tail) ? (uint32_t)total : sizeof(tail);
+	volatile const char *ring = (volatile const char *)LOGDUMP_RING;
+
+	con_clear(0xff000040U);
+	con_scale(2);
+	con_hex2("RING", "total=", (uint32_t)total, "hi=", (uint32_t)(total >> 32));
+	for (uint32_t i = 0; i < n; i++)
+		tail[i] = ring[(total - n + i) % RING_SIZE];
+	/* split into screen rows: newlines and wrapping */
+	int cols = con_cols(), nrows = 0;
+	for (uint32_t i = 0; i < n && nrows < 400;) {
+		uint32_t j = i;
+		while (j < n && tail[j] != '\n' && (int)(j - i) < cols)
+			j++;
+		starts[nrows] = i;
+		lens[nrows++] = j - i;
+		i = (j < n && tail[j] == '\n') ? j + 1 : j;
+	}
+	int show = con_rows() - 2;
+	for (int r = nrows > show ? nrows - show : 0; r < nrows; r++)
+		con_raw(tail + starts[r], lens[r]);
+}
+#endif
+
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
 
+#ifdef LOGDUMP
+	dump_ring();
+	delay_ms(600000);
+	reset(20);
+#endif
+
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
-	con_str("SHIM", "sweet milestone 4: xnu loader");
+	con_str("SHIM", BOARD_NAME " milestone A: xnu loader");
+	con_skip();
+	con_hex2("DTB", "at=", dtb, "hi=", dtb >> 32);
+	con_hex2("EL", "cur=", rsr("CurrentEL") >> 2, "mpidr=", rsr("mpidr_el1"));
+	{
+		static uint64_t mem[32];
+		int n = fdt_memory(dtb, mem, 32);
+		con_hex2("MEM", "ranges=", n, 0, 0);
+		for (int i = 0; i < n && i < 12; i++)
+			con_hex2(" mem", "base=", (uint32_t)(mem[2 * i] >> 12), "MiB=", (uint32_t)(mem[2 * i + 1] >> 20));
+	}
+	con_skip();
+	/* barbet: ABL leaves the UFS device Not Ready; the probe wakes it (SSU) for xnu. */
+	test_ufs();
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
 
-	/* No payload: probe the internal UFS while the MMU is still off. */
 	stage = "ufs";
-	test_ufs();
-	con_skip();
-	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
-	con_str("UFS", "probe done, reset in ~3 min");
-	delay_ms(180000);
-	reset(20);
+	/* No payload: on to the CPU/MMU/PSCI/GIC timer checks (sweet milestone 3). */
+	con_str("UFS", "probe done, GIC/timer test in 20 s");
+	delay_ms(20000);
 
 	stage = "fill off";
 	uint64_t fill_off = ticks_fill(RED);
@@ -405,7 +460,7 @@ void shim_main(uint64_t dtb)
 	if (rc)
 		con_clear(RED);
 
-	con_str("SHIM", "sweet milestone 3");
+	con_str("SHIM", BOARD_NAME " milestone 3: mmu/psci/gic");
 	con_skip();
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
 	con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);
@@ -428,8 +483,13 @@ void shim_main(uint64_t dtb)
 	stage = "psci";
 	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "smccc=", smc(SMCCC_VERSION, 0, 0, 0));
 	con_skip();
+	test_smp();
+	con_skip();
 	test_gic();
 
 	stage = "done";
+	con_skip();
+	con_str("DONE", "reset in ~3 min");
+	delay_ms(180000);
 	reset(40);
 }

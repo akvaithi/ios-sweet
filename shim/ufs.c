@@ -13,7 +13,8 @@
 #include "console.h"
 #include "ufs.h"
 
-#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, sweet live FDT */
+#include "board.h"
+#define UFS_BASE	BOARD_UFS
 
 #define REG_CAP		0x00
 #define REG_VER		0x08
@@ -135,6 +136,15 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	return *status_out ? 4 : 0;
 }
 
+/* Sense data from the last response UPIU: key, ASC, ASCQ (SPC fixed format). */
+static void show_sense(const char *label, uint32_t rc, uint32_t ocs, uint32_t st)
+{
+	const uint8_t *sd = ucd.resp + 34;
+	uint32_t len = (uint32_t)ucd.resp[32] << 8 | ucd.resp[33];
+	con_hex2(label, "rc/ocs/st=", rc << 16 | ocs << 8 | st,
+		 "key/asc/q=", len ? (uint32_t)(sd[2] & 0xf) << 16 | (uint32_t)sd[12] << 8 | sd[13] : 0xffffffff);
+}
+
 static uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
 {
 	uint8_t cdb[10] = { 0x28, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, count >> 8, count, 0 };
@@ -230,24 +240,36 @@ void test_ufs(void)
 
 	uint32_t ocs = 0, st = 0, rc;
 	static const uint8_t tur[6] = { 0x00 };
-	/* A first command may report a unit attention; retry a few times. */
-	for (int i = 0; i < 3; i++) {
+	/*
+	 * barbet: every command came back CHECK CONDITION. Show the sense data
+	 * (key/ASC/ASCQ) and try waking the device W-LUN (0xd0) with START STOP
+	 * UNIT, power condition ACTIVE, in case ABL left it in a low-power mode.
+	 * Neither touches the medium.
+	 */
+	for (int i = 0; i < 8; i++) {
 		rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
-		con_hex2("UFS TUR", "rc=", rc, "ocs/st=", ocs << 8 | st);
 		if (!rc)
 			break;
+		if (i < 2 || i == 7)
+			show_sense("UFS TUR", rc, ocs, st);
+		if (i == 2) {
+			static const uint8_t ssu_active[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
+			uint32_t r2 = scsi(0xd0, ssu_active, sizeof(ssu_active), 0, 0, &ocs, &st);
+			show_sense("UFS SSU", r2, ocs, st);
+		}
 	}
+	con_hex2("UFS TUR", "rc=", rc, "ocs/st=", ocs << 8 | st);
 
 	static const uint8_t cap10[10] = { 0x25 };	/* READ CAPACITY(10) */
 	rc = scsi(0, cap10, sizeof(cap10), data, 8, &ocs, &st);
-	con_hex2("UFS CAP", "rc=", rc, "ocs/st=", ocs << 8 | st);
+	show_sense("UFS CAP", rc, ocs, st);
 	if (!rc)
 		con_hex2("UFS LUN0", "lastlba=", be32(data), "blk=", be32(data + 4));
 
 	/* READ(10) LBA 0, 2 blocks: protective MBR and the GPT header. */
 	static const uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0 };
 	rc = scsi(0, rd10, sizeof(rd10), data, 2 * BLOCK, &ocs, &st);
-	con_hex2("UFS READ", "rc=", rc, "ocs/st=", ocs << 8 | st);
+	show_sense("UFS READ", rc, ocs, st);
 	if (rc)
 		return;
 	con_hex2("UFS MBR", "sig=", data[510] | data[511] << 8, "type=", data[450]);
