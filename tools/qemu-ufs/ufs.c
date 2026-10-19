@@ -25,8 +25,21 @@
 
 static uint8_t utrl[32 * 32] __attribute__((aligned(1024)));
 
-static inline uint32_t rd(uintptr_t a) { return *(volatile uint32_t *)a; }
-static inline void wr(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
+/*
+ * Plain ldr/str only: under HVF an MMIO abort is emulated from the ESR's
+ * syndrome, which writeback or pair forms do not provide (QEMU asserts isv).
+ */
+static inline uint32_t rd(uintptr_t a)
+{
+	uint32_t v;
+	__asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(a) : "memory");
+	return v;
+}
+
+static inline void wr(uintptr_t a, uint32_t v)
+{
+	__asm__ volatile("str %w0, [%1]" : : "r"(v), "r"(a) : "memory");
+}
 
 static void spin(uintptr_t a, uint32_t mask, uint32_t want)
 {

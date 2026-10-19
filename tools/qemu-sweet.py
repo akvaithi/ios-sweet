@@ -229,6 +229,7 @@ def main():
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
     ap.add_argument('--ufs', help='raw GPT disk for QEMU\'s UFS host (needs tools/qemu-ufs/build.sh and an ADT from mkadt.py --qemu-ufs)')
     ap.add_argument('--fb', type=lambda v: int(v, 0), help='framebuffer PA for fb.png (default 0x9c000000; barbet kernels 0xa0000000)')
+    ap.add_argument('--hvf', action='store_true', help='run on the host CPU with Hypervisor.framework (Apple Silicon): -accel hvf -cpu host')
     ap.add_argument('--quiet-log', action='store_true', help='log only guest errors, not every interrupt (for long runs)')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
@@ -288,7 +289,11 @@ def main():
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     machine = 'virt,gic-version=3' + (',highmem-ecam=off' if a.ufs else '')
-    cmd = ['qemu-system-aarch64', '-M', machine, '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
+    cpu = a.cpu
+    if a.hvf:
+        machine += ',accel=hvf'
+        cpu = 'host'
+    cmd = ['qemu-system-aarch64', '-M', machine, '-cpu', cpu, '-smp', '1', '-m', f'{ram_gib}G',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'guest_errors,unimp' if a.quiet_log else 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
