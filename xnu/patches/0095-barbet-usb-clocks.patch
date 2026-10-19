@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 3c251aa..f117da1 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -52,12 +52,21 @@ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
++#if defined(SWEET_BOARD_REDMI)	/* gcc-sdmmagpie */
+ 	{ "master", 0x0f010 },
+ 	{ "sleep", 0x0f014 },
+ 	{ "utmi", 0x0f018 },
+ 	{ "cfg-noc-axi", 0x0502c },
+ 	{ "aggre-axi", 0x8201c },
+ 	{ "ahb2phy", 0x6a004 },
++#else				/* gcc-lito (barbet); no ahb2phy (femto PHY) */
++	{ "master", 0x0f010 },
++	{ "sleep", 0x0f018 },
++	{ "utmi", 0x0f01c },
++	{ "cfg-noc-axi", 0x0f07c },
++	{ "aggre-axi", 0x0f080 },
++	{ "ahb2phy", 0x0f010 },	/* placeholder: QUSB2 is never read on barbet */
++#endif
+ 	{ "clkref", 0x8c010 },
+ };
+ 
