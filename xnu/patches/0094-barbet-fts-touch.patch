@@ -1,0 +1,538 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..fe43a3b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/sweet_fts.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+new file mode 100644
+index 0000000..8ef266b
+--- /dev/null
++++ b/bsd/dev/sweet_fts.c
+@@ -0,0 +1,491 @@
++/*
++ * barbet (Pixel 5a) touch: ST FTM5 on QUPv3 wrapper 0 SE0 in SPI mode,
++ * polled, events into SweetHIDTouch through sweet_hid_touch().
++ *
++ * Facts (factory DT "Barbet MP", kernel/msm-modules/fts_touch,
++ * redbull drivers/clk/qcom/gcc-lito.c, pinctrl-lito.c, spi-geni-qcom.c):
++ *   SE0 @0x880000, SPI mode 0, <= 10 MHz; pins GPIO42-45 function qup00 (1)
++ *   reset GPIO8 (active low), IRQ GPIO9 (active low)
++ *   touch bus negotiator: ap2lpi GPIO35 out, lpi2ap GPIO5 in; owner AP = 0
++ *   GCC vote 0x52008 bits 6..10 (wrap0 m/s AHB, core, core2x, s0)
++ *   SE0 RCG 0x17010 in DFS mode: SE_GENI_CLK_SEL picks a perf level
++ *   FTM5 SPI: opcode + 32-bit BE address, reads carry one dummy byte;
++ *   FIFO read-all 0x87, 8-byte events: 0x03 ready, 0x13/0x23/0x33 touch
++ *
++ * Writes only: the touch pins' TLMM config, the QUP wrapper 0 clock votes,
++ * SE0 registers, and the IC's runtime commands (reset, scan on). No
++ * firmware, config or flash access. Boot-arg sweettouch=1 enables it.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(SWEET_BOARD_REDMI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_fts_init(void);
++
++#define FTS_GCC_PA       0x00100000u
++#define FTS_GCC_SIZE     0x00060000u
++#define FTS_GCC_VOTE     0x52008u
++#define FTS_GCC_VOTE_BITS (0x1fu << 6)
++#define FTS_RCG          0x17010u
++#define FTS_TLMM_PA      0x0f000000u
++#define FTS_TLMM_SIZE    0x00a00000u
++#define FTS_EAST         0x00900000u
++#define FTS_WEST         0x00500000u
++#define FTS_SE_PA        0x00880000u
++
++#define GPIO_TBN_LPI2AP  5u     /* EAST */
++#define GPIO_RESET       8u     /* WEST */
++#define GPIO_IRQ         9u     /* WEST */
++#define GPIO_TBN_AP2LPI  35u    /* EAST */
++
++#define SE_STATUS        0x040u
++#define SE_MCLK          0x048u
++#define SE_FW            0x068u
++#define SE_CLK_SEL       0x07cu
++#define SE_SPI_CPHA      0x224u
++#define SE_SPI_LOOPBACK  0x22cu
++#define SE_SPI_CPOL      0x230u
++#define SE_SPI_DEMUX_INV 0x24cu
++#define SE_SPI_DEMUX_SEL 0x250u
++#define SE_GRAN          0x254u
++#define SE_DMA           0x258u
++#define SE_SPI_TRANS_CFG 0x25cu
++#define SE_SPI_WORD_LEN  0x268u
++#define SE_TX_LEN        0x26cu
++#define SE_RX_LEN        0x270u
++#define SE_SPI_DLY       0x274u
++#define SE_SPI_DLY_CNT   0x278u
++#define SE_CMD           0x600u
++#define SE_CTRL          0x604u
++#define SE_IRQ           0x610u
++#define SE_IRQ_EN        0x614u
++#define SE_IRQ_CLR       0x618u
++#define SE_TX            0x700u
++#define SE_RX            0x780u
++#define SE_TX_COUNT      0x800u
++#define SE_RX_COUNT      0x804u
++#define SE_TX_WM         0x80cu
++#define SE_HW_TX         0xe24u
++#define SE_HW_RX         0xe28u
++#define SE_DONE          (1u << 0)
++#define SE_RX_WM_IRQ     (1u << 26)
++#define SE_RX_LAST       (1u << 27)
++#define SE_TX_WM_IRQ     (1u << 30)
++#define SE_ERRORS        (0x3eu | (1u << 9) | (3u << 24) | (3u << 28))
++#define SE_PACK0         0x0007f8feu    /* 8-bit words, 4 per FIFO word (as sweet_touch.c) */
++#define SE_PACK1         0x000ffefeu
++#define SPI_FULL_DUPLEX  3u
++#define SPI_PROTO        1u
++
++#define FTS_CMD_FIFO     0x87u
++#define FTS_CMD_HW_R     0xfbu
++#define FTS_CMD_HW_W     0xfau
++#define FTS_CMD_SCAN     0xa0u
++#define EVT_READY        0x03u
++#define EVT_ENTER        0x13u
++#define EVT_MOTION       0x23u
++#define EVT_LEAVE        0x33u
++#define FTS_FINGERS      10u
++
++static struct {
++	vm_offset_t gcc, tlmm, se;
++	bool started, dead;
++	unsigned tx_depth;
++	uint16_t down;
++} ft;
++static int fts_sleep_chan;
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++fts_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&fts_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* TLMM config register of a pin: tile base + 0x1000 * pin. */
++static uint32_t
++gpio_off(unsigned pin)
++{
++	return ((pin == GPIO_RESET || pin == GPIO_IRQ) ? FTS_WEST : FTS_EAST) + pin * 0x1000u;
++}
++
++static void
++gpio_cfg(unsigned pin, unsigned mux, unsigned pull, unsigned drive_ma, bool out, bool high)
++{
++	uint32_t off = gpio_off(pin);
++	if (out) {	/* latch the level before turning the output on */
++		wr(ft.tlmm, off + 4u, (rd(ft.tlmm, off + 4u) & ~2u) | (high ? 2u : 0u));
++	}
++	uint32_t cfg = rd(ft.tlmm, off) & ~0x3ffu;
++	cfg |= (mux << 2) | pull | ((drive_ma / 2u - 1u) << 6) | (out ? 0x200u : 0u);
++	wr(ft.tlmm, off, cfg);
++}
++
++static void
++gpio_set(unsigned pin, bool high)
++{
++	uint32_t off = gpio_off(pin) + 4u;
++	wr(ft.tlmm, off, (rd(ft.tlmm, off) & ~2u) | (high ? 2u : 0u));
++}
++
++static bool
++gpio_get(unsigned pin)
++{
++	return rd(ft.tlmm, gpio_off(pin) + 4u) & 1u;
++}
++
++static bool
++fts_clocks(void)
++{
++	wr(ft.gcc, FTS_GCC_VOTE, rd(ft.gcc, FTS_GCC_VOTE) | FTS_GCC_VOTE_BITS);
++	const uint32_t branches[] = {0x17004, 0x17008, 0x23000, 0x23008, 0x1700c};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (!wait_clear(ft.gcc, branches[i], 1u << 31)) {
++			printf("SWEET FTS: GCC branch %#x stays off (%#x)\n", branches[i],
++			    rd(ft.gcc, branches[i]));
++			return false;
++		}
++	}
++	/* DFS perf levels: SRC [10:8], HID divider [4:0]. Use XO/1 = 19.2 MHz. */
++	uint32_t dfs = rd(ft.gcc, FTS_RCG + 0x14u);
++	if (!(dfs & 1u)) {
++		printf("SWEET FTS: SE0 RCG not in DFS mode (%#x)\n", dfs);
++		return false;
++	}
++	for (unsigned lvl = 0; lvl < 8; ++lvl) {
++		uint32_t perf = rd(ft.gcc, FTS_RCG + 0x1cu + 4u * lvl);
++		if ((perf & 0x71fu) == 1u) {
++			wr(ft.se, SE_CLK_SEL, lvl);
++			wr(ft.se, SE_MCLK, (2u << 4) | 1u);	/* /2 -> 9.6 MHz */
++			printf("SWEET FTS: SE0 clock DFS level %u (XO) /2 = 9.6 MHz\n", lvl);
++			return true;
++		}
++	}
++	printf("SWEET FTS: no XO level in SE0 DFS table\n");
++	return false;
++}
++
++static bool
++fts_se_init(void)
++{
++	uint32_t fw = rd(ft.se, SE_FW), tx = rd(ft.se, SE_HW_TX), rx = rd(ft.se, SE_HW_RX);
++	printf("SWEET FTS: se0 fw=%#x proto=%u status=%#x tx=%#x rx=%#x\n",
++	    fw, (fw >> 8) & 0xffu, rd(ft.se, SE_STATUS), tx, rx);
++	if (((fw >> 8) & 0xffu) != SPI_PROTO || ((tx >> 24) & 0x3fu) != 32u ||
++	    ((rx >> 24) & 0x3fu) != 32u) {
++		printf("SWEET FTS: SE0 has no SPI firmware / 32-bit FIFOs; stopping\n");
++		return false;
++	}
++	if (rd(ft.se, SE_STATUS) & 0x1001u) {
++		printf("SWEET FTS: SE0 busy; stopping\n");
++		return false;
++	}
++	ft.tx_depth = (tx >> 16) & 0x3fu;
++	wr(ft.se, 0xe18, 0);	/* no GSI events */
++	wr(ft.se, 0xe1c, 0);	/* poll local status */
++	wr(ft.se, 0x644, 0);
++	wr(ft.se, SE_IRQ_CLR, 0xffffffffu);
++	wr(ft.se, 0x648, 0xffffffffu);
++	wr(ft.se, SE_DMA, 0);	/* FIFO mode */
++	wr(ft.se, 0x28, rd(ft.se, 0x28) | 0x7fu);
++	wr(ft.se, 0xe30, rd(ft.se, 0xe30) | 0x0fu);
++	wr(ft.se, 0x24, 0x7f);
++	wr(ft.se, 0x20, 1);
++	wr(ft.se, SE_SPI_LOOPBACK, 0);
++	wr(ft.se, SE_SPI_CPHA, 0);
++	wr(ft.se, SE_SPI_CPOL, 0);
++	wr(ft.se, SE_SPI_DEMUX_INV, 0);
++	wr(ft.se, SE_SPI_DEMUX_SEL, 0);	/* CS0 */
++	wr(ft.se, SE_SPI_TRANS_CFG, 0);
++	wr(ft.se, SE_SPI_WORD_LEN, 8u - 4u);
++	wr(ft.se, SE_SPI_DLY, 0);
++	wr(ft.se, SE_SPI_DLY_CNT, 0);
++	wr(ft.se, SE_GRAN, 0);
++	wr(ft.se, 0x260, SE_PACK0);
++	wr(ft.se, 0x264, SE_PACK1);
++	wr(ft.se, 0x284, SE_PACK0);
++	wr(ft.se, 0x288, SE_PACK1);
++	wr(ft.se, SE_TX_WM, 0);
++	wr(ft.se, 0x810, 0);
++	wr(ft.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	wr(ft.se, SE_IRQ_EN, SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ);
++	return true;
++}
++
++/* One full-duplex transfer with CS held: len bytes out (tx may be shorter, zero padded), len in. */
++static int
++fts_xfer(const uint8_t *tx, unsigned ntx, uint8_t *rx, unsigned len)
++{
++	if (ft.dead || len == 0 || len > 256 || ntx > len) {
++		return EIO;
++	}
++	if (!wait_clear(ft.se, SE_STATUS, 1u)) {
++		ft.dead = true;
++		return EBUSY;
++	}
++	wr(ft.se, SE_IRQ_CLR, 0xffffffffu);
++	wr(ft.se, SE_TX_LEN, len);
++	wr(ft.se, SE_RX_LEN, len);
++	wr(ft.se, SE_TX_WM, 1);
++	wr(ft.se, SE_CMD, SPI_FULL_DUPLEX << 27);
++	unsigned sent = 0, got = 0;
++	for (unsigned spin = 0; spin < 200000; ++spin) {
++		uint32_t irq = rd(ft.se, SE_IRQ);
++		if (irq & SE_ERRORS) {
++			printf("SWEET FTS: SPI error irq=%#x\n", irq);
++			wr(ft.se, SE_CTRL, 2);	/* abort */
++			wr(ft.se, SE_IRQ_CLR, 0xffffffffu);
++			return EIO;
++		}
++		if (sent < len && (irq & SE_TX_WM_IRQ)) {
++			unsigned room = ft.tx_depth > 1 ? ft.tx_depth - 1u : 1u;
++			while (sent < len && room--) {
++				uint32_t word = 0;
++				for (unsigned b = 0; b < 4 && sent + b < len; ++b) {
++					word |= (uint32_t)(sent + b < ntx ? tx[sent + b] : 0) << (8u * b);
++				}
++				wr(ft.se, SE_TX, word);
++				sent += 4;
++			}
++			wr(ft.se, SE_IRQ_CLR, SE_TX_WM_IRQ);
++			if (sent >= len) {
++				wr(ft.se, SE_TX_WM, 0);
++			}
++		}
++		uint32_t words = rd(ft.se, SE_RX_COUNT) & 0x1ffffffu;
++		while (words-- && got < len) {
++			uint32_t word = rd(ft.se, SE_RX);
++			for (unsigned b = 0; b < 4 && got < len; ++b, ++got) {
++				rx[got] = (uint8_t)(word >> (8u * b));
++			}
++		}
++		if (irq & (SE_RX_WM_IRQ | SE_RX_LAST)) {
++			wr(ft.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST));
++		}
++		if ((irq & SE_DONE) && got >= len) {
++			wr(ft.se, SE_IRQ_CLR, 0xffffffffu);
++			return 0;
++		}
++		if (spin > 1000) {
++			delay(1);
++		}
++	}
++	printf("SWEET FTS: SPI timeout sent=%u got=%u/%u\n", sent, got, len);
++	wr(ft.se, SE_CTRL, 2);
++	ft.dead = true;
++	return ETIMEDOUT;
++}
++
++static int
++fts_write(const uint8_t *buf, unsigned n)
++{
++	uint8_t junk[16];
++	return n <= sizeof(junk) ? fts_xfer(buf, n, junk, n) : EIO;
++}
++
++/* Opcode (+ address) then one dummy byte, then n data bytes. */
++static int
++fts_read(const uint8_t *cmd, unsigned ncmd, uint8_t *out, unsigned n)
++{
++	uint8_t rx[128];
++	unsigned len = ncmd + 1u + n;
++	if (len > sizeof(rx)) {
++		return EIO;
++	}
++	int err = fts_xfer(cmd, ncmd, rx, len);
++	if (!err) {
++		bcopy(rx + ncmd + 1u, out, n);
++	}
++	return err;
++}
++
++static int
++fts_hw_read(uint32_t addr, uint8_t *out, unsigned n)
++{
++	const uint8_t cmd[5] = {FTS_CMD_HW_R, (uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
++		                (uint8_t)(addr >> 8), (uint8_t)addr};
++	return fts_read(cmd, sizeof(cmd), out, n);
++}
++
++static int
++fts_event(uint8_t ev[8])
++{
++	const uint8_t cmd = FTS_CMD_FIFO;
++	return fts_read(&cmd, 1, ev, 8);
++}
++
++static void
++fts_handle(const uint8_t ev[8])
++{
++	unsigned id = ev[1] >> 4;
++	if (id >= FTS_FINGERS) {
++		return;
++	}
++	int x = ((ev[3] & 0x0f) << 8) | ev[2];
++	int y = (ev[4] << 4) | (ev[3] >> 4);
++	switch (ev[0]) {
++	case EVT_ENTER:
++	case EVT_MOTION:
++		ft.down |= (uint16_t)(1u << id);
++		sweet_hid_touch((int)id, 1, x, y);
++		break;
++	case EVT_LEAVE:
++		ft.down &= (uint16_t)~(1u << id);
++		sweet_hid_touch((int)id, 0, x, y);
++		break;
++	default:
++		break;
++	}
++}
++
++static bool
++fts_bringup(void)
++{
++	/* Bus to the AP (negotiator) before muxing the pins to the QUP. */
++	gpio_cfg(GPIO_TBN_LPI2AP, 0, 0, 2, false, false);
++	gpio_cfg(GPIO_TBN_AP2LPI, 0, 0, 2, true, false);
++	for (unsigned i = 0; i < 50 && gpio_get(GPIO_TBN_LPI2AP); ++i) {
++		fts_wait(10);
++	}
++	printf("SWEET FTS: bus negotiator lpi2ap=%u (0 = AP owns the bus)\n", gpio_get(GPIO_TBN_LPI2AP));
++	for (unsigned pin = 42; pin <= 45; ++pin) {
++		gpio_cfg(pin, 1, 0, 8, false, false);	/* qup00, no pull, 8 mA */
++	}
++	gpio_cfg(GPIO_IRQ, 0, 3, 2, false, false);	/* input, pull-up */
++	if (!fts_clocks() || !fts_se_init()) {
++		return false;
++	}
++	/* Hardware reset, then wait for the controller-ready event. */
++	gpio_cfg(GPIO_RESET, 0, 0, 2, true, true);
++	gpio_set(GPIO_RESET, false);
++	fts_wait(10);
++	gpio_set(GPIO_RESET, true);
++	uint8_t ev[8];
++	bool ready = false;
++	for (unsigned i = 0; i < 100 && !ready; ++i) {
++		fts_wait(10);
++		while (!fts_event(ev) && ev[0] != 0 && ev[0] != 0xff) {
++			if (ev[0] == EVT_READY) {
++				ready = true;
++				break;
++			}
++		}
++	}
++	uint8_t id[2] = {0, 0};
++	(void)fts_hw_read(0x20000000u, id, sizeof(id));
++	printf("SWEET FTS: chip id %02x %02x, controller %s\n", id[0], id[1], ready ? "ready" : "NOT ready");
++	if (id[0] != 0x36) {
++		return false;
++	}
++	/* setScanMode(SCAN_MODE_ACTIVE, 0xff) as fts_mode_handler does on resume. */
++	const uint8_t pre[7] = {FTS_CMD_HW_W, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00};
++	const uint8_t scan[3] = {FTS_CMD_SCAN, 0x00, 0xff};
++	if (fts_write(pre, sizeof(pre)) || fts_write(scan, sizeof(scan))) {
++		return false;
++	}
++	printf("SWEET FTS: sensing on\n");
++	return true;
++}
++
++static void
++fts_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 45;
++	(void)arg;
++	(void)result;
++	/* Start late: if the bus access hangs, the GUI and the log got there first. */
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET FTS: starting in %u s\n", delay_s);
++	fts_wait(delay_s * 1000u);
++	ft.gcc = ml_io_map(FTS_GCC_PA, FTS_GCC_SIZE);
++	ft.tlmm = ml_io_map(FTS_TLMM_PA, FTS_TLMM_SIZE);
++	ft.se = ml_io_map(FTS_SE_PA, 0x4000);
++	if (!ft.gcc || !ft.tlmm || !ft.se || !fts_bringup()) {
++		printf("SWEET FTS: bring-up failed; touch off\n");
++		thread_terminate(current_thread());
++		return;
++	}
++	unsigned errors = 0;
++	for (;;) {
++		/* IRQ line low = events pending; still poll every 100 ms in case it is not wired as expected. */
++		uint8_t ev[8];
++		for (unsigned n = 0; n < 32 && (!gpio_get(GPIO_IRQ) || n == 0); ++n) {
++			if (fts_event(ev)) {
++				if ((errors++ % 100u) == 0) {
++					printf("SWEET FTS: FIFO read error\n");
++				}
++				break;
++			}
++			if (ev[0] == 0 || ev[0] == 0xff) {
++				break;
++			}
++			fts_handle(ev);
++		}
++		if (ft.dead) {
++			printf("SWEET FTS: SPI engine dead; touch off\n");
++			break;
++		}
++		fts_wait(gpio_get(GPIO_IRQ) ? 10 : 1);
++	}
++	thread_terminate(current_thread());
++}
++
++void
++sweet_fts_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	if (ft.started) {
++		return;
++	}
++	ft.started = true;
++	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET FTS: disabled (sweettouch=1 enables)\n");
++		return;
++	}
++	if (kernel_thread_start(fts_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET && !SWEET_BOARD_REDMI */
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..f48dd9c 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -5,6 +5,7 @@
+  * No firmware/config upload or direct PMIC writes. Only IC data write:
+  * zero to GT9896's event status after reading a report. See touch2/report.md.
+  */
++#include <pexpert/arm64/board_config.h>
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -638,6 +639,16 @@ out:
+ void
+ sweet_touch_init(void)
+ {
++#if !defined(SWEET_BOARD_REDMI)
++	/* barbet: ST FTM5 over SPI (sweet_fts.c); the I2C path would probe sweet's SE7. */
++	extern void sweet_fts_init(void);
++	sweet_fts_init();
++}
++
++static void __unused
++sweet_touch_init_redmi(void)
++{
++#endif
+ 	int enabled = 1;
+ 	thread_t thread;
+ 	if (st.started) {
