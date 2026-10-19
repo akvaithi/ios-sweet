@@ -1,0 +1,62 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..6f270ab 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -21,6 +21,7 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
++#include <kern/thread.h>
+ 
+ #include "IOHIDEventService.h"
+ #include "IOHIDEventServiceUserClient.h"
+@@ -361,6 +362,7 @@ class SweetHIDTouch : public IOHIDEventService {
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void touch(int finger, bool down, int x, int y);
++	static void swipeThread(void *arg, wait_result_t result);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
+@@ -445,9 +447,41 @@ SweetHIDTouch::start(IOService *provider)
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
++	UInt32 swipe = 0;
++	if (PE_parse_boot_argn("sweetswipe", &swipe, sizeof(swipe)) && swipe) {
++		thread_t thread;
++		if (kernel_thread_start(&SweetHIDTouch::swipeThread, (void *)(uintptr_t)swipe, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	}
+ 	return true;
+ }
+ 
++/*
++ * Boot-arg sweetswipe=N: every N seconds, one finger swipes up from the
++ * bottom edge to mid-screen (~300 ms) -- the iPhone X unlock / go-home
++ * gesture -- through the same path as the touch driver. For bring-up
++ * without a working digitizer (QEMU, or before the panel's touch IC is
++ * ported); harmless once on the home screen.
++ */
++void
++SweetHIDTouch::swipeThread(void *arg, wait_result_t)
++{
++	UInt32 secs = (UInt32)(uintptr_t)arg;
++	for (unsigned n = 1;; n++) {
++		IOSleep(secs * 1000);
++		if (!gSweetTouch) {
++			continue;
++		}
++		IOLog("SWEET HID: test swipe %u\n", n);
++		for (int step = 0; step <= 20; step++) {
++			gSweetTouch->touch(0, true, 540, 2396 - step * 60);
++			IOSleep(16);
++		}
++		gSweetTouch->touch(0, false, 540, 1196);
++	}
++}
++
+ void
+ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ {
