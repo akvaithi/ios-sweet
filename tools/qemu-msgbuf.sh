@@ -6,7 +6,8 @@
 set -euo pipefail
 payload=$1 kernel=$2 out=$3 secs=${4:-150}
 here=$(cd "$(dirname "$0")" && pwd)
-q() { python3 "$here/qemu-sweet.py" "$payload" "$1" --secs "$2" "${@:3}" >/dev/null 2>&1 || true; }
+# QEMU_EXTRA: extra qemu-sweet.py options for every run (e.g. "--ufs disk.raw --fb 0xa0000000")
+q() { python3 "$here/qemu-sweet.py" "$payload" "$1" --secs "$2" ${QEMU_EXTRA:-} "${@:3}" >/dev/null 2>&1 || true; }
 hx() { awk -v c="$2" 'f && /^[0-9a-f]+:/ {print $2; exit} index($0, c) {f=1}' "$1/regs.txt"; }
 
 p=$(nm "$kernel" | awk '$3=="_msgbufp"{print "0x"$1}')
