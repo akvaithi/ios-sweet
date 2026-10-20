@@ -1,0 +1,60 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index e773839..12bb1bd 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -404,11 +404,23 @@ fts_bringup(void)
+ 	if (!fts_clocks() || !fts_se_init()) {
+ 		return false;
+ 	}
+-	/* Hardware reset, then wait for the controller-ready event. */
++	/*
++	 * Bring-up experiments, boot-arg sweetftsx bits: 1 skip the GPIO reset,
++	 * 2 reset over SPI (0x81 -> 0x20000024) instead, 4 write IER=0x41 after
++	 * sense on, 8 also send legacy mutual sense on (0x93).
++	 */
++	unsigned x = 0;
++	(void)PE_parse_boot_argn("sweetftsx", &x, sizeof(x));
++	printf("SWEET FTS: experiments sweetftsx=%#x\n", x);
+ 	gpio_cfg(GPIO_RESET, 0, 0, 2, true, true);
+-	gpio_set(GPIO_RESET, false);
+-	fts_wait(10);
+-	gpio_set(GPIO_RESET, true);
++	if (x & 2) {
++		const uint8_t rst[6] = {FTS_CMD_HW_W, 0x20, 0x00, 0x00, 0x24, 0x81};
++		(void)fts_write(rst, sizeof(rst));
++	} else if (!(x & 1)) {
++		gpio_set(GPIO_RESET, false);
++		fts_wait(10);
++		gpio_set(GPIO_RESET, true);
++	}
+ 	uint8_t ev[8];
+ 	bool ready = false;
+ 	for (unsigned i = 0; i < 100 && !ready; ++i) {
+@@ -432,7 +444,17 @@ fts_bringup(void)
+ 	if (fts_write(pre, sizeof(pre)) || fts_write(scan, sizeof(scan))) {
+ 		return false;
+ 	}
+-	uint8_t icr = 0;
++	if (x & 8) {
++		const uint8_t ms_on = 0x93;
++		(void)fts_write(&ms_on, 1);
++	}
++	if (x & 4) {
++		const uint8_t ier[6] = {FTS_CMD_HW_W, 0x20, 0x00, 0x00, 0x29, 0x41};
++		(void)fts_write(ier, sizeof(ier));
++	}
++	uint8_t icr = 0, ier_v = 0;
++	(void)fts_hw_read(0x20000029u, &ier_v, 1);
++	printf("SWEET FTS: IER=%#x\n", ier_v);
+ 	(void)fts_hw_read(0x2000002du, &icr, 1);
+ 	printf("SWEET FTS: sensing on (ICR=%#x irq-line=%u)\n", icr, gpio_get(GPIO_IRQ));
+ 	return true;
+@@ -482,7 +504,7 @@ fts_thread(void *arg, wait_result_t result)
+ 				break;
+ 			}
+ 			nonzero++;
+-			if (logged < 40) {
++			if (logged < 80) {
+ 				logged++;
+ 				printf("SWEET FTS: ev %02x %02x %02x %02x %02x %02x %02x %02x\n",
+ 				    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
