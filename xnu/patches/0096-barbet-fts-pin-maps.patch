@@ -1,0 +1,85 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index 8ef266b..56e08c0 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -38,7 +38,6 @@ void sweet_fts_init(void);
+ #define FTS_GCC_VOTE_BITS (0x1fu << 6)
+ #define FTS_RCG          0x17010u
+ #define FTS_TLMM_PA      0x0f000000u
+-#define FTS_TLMM_SIZE    0x00a00000u
+ #define FTS_EAST         0x00900000u
+ #define FTS_WEST         0x00500000u
+ #define FTS_SE_PA        0x00880000u
+@@ -98,7 +97,8 @@ void sweet_fts_init(void);
+ #define FTS_FINGERS      10u
+ 
+ static struct {
+-	vm_offset_t gcc, tlmm, se;
++	vm_offset_t gcc, se;
++	vm_offset_t pin[64];	/* one 4 KiB TLMM page per pin used; the whole TLMM (10 MiB) does not fit the I/O map */
+ 	bool started, dead;
+ 	unsigned tx_depth;
+ 	uint16_t down;
+@@ -142,36 +142,40 @@ wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
+ 	return false;
+ }
+ 
+-/* TLMM config register of a pin: tile base + 0x1000 * pin. */
+-static uint32_t
+-gpio_off(unsigned pin)
++/* TLMM page of a pin (config at +0, in/out at +4): tile base + 0x1000 * pin. */
++static vm_offset_t
++gpio_page(unsigned pin)
+ {
+-	return ((pin == GPIO_RESET || pin == GPIO_IRQ) ? FTS_WEST : FTS_EAST) + pin * 0x1000u;
++	if (!ft.pin[pin]) {
++		uint32_t tile = (pin == GPIO_RESET || pin == GPIO_IRQ) ? FTS_WEST : FTS_EAST;
++		ft.pin[pin] = ml_io_map(FTS_TLMM_PA + tile + pin * 0x1000u, 0x1000);
++	}
++	return ft.pin[pin];
+ }
+ 
+ static void
+ gpio_cfg(unsigned pin, unsigned mux, unsigned pull, unsigned drive_ma, bool out, bool high)
+ {
+-	uint32_t off = gpio_off(pin);
++	vm_offset_t p = gpio_page(pin);
+ 	if (out) {	/* latch the level before turning the output on */
+-		wr(ft.tlmm, off + 4u, (rd(ft.tlmm, off + 4u) & ~2u) | (high ? 2u : 0u));
++		wr(p, 4u, (rd(p, 4u) & ~2u) | (high ? 2u : 0u));
+ 	}
+-	uint32_t cfg = rd(ft.tlmm, off) & ~0x3ffu;
++	uint32_t cfg = rd(p, 0) & ~0x3ffu;
+ 	cfg |= (mux << 2) | pull | ((drive_ma / 2u - 1u) << 6) | (out ? 0x200u : 0u);
+-	wr(ft.tlmm, off, cfg);
++	wr(p, 0, cfg);
+ }
+ 
+ static void
+ gpio_set(unsigned pin, bool high)
+ {
+-	uint32_t off = gpio_off(pin) + 4u;
+-	wr(ft.tlmm, off, (rd(ft.tlmm, off) & ~2u) | (high ? 2u : 0u));
++	vm_offset_t p = gpio_page(pin);
++	wr(p, 4u, (rd(p, 4u) & ~2u) | (high ? 2u : 0u));
+ }
+ 
+ static bool
+ gpio_get(unsigned pin)
+ {
+-	return rd(ft.tlmm, gpio_off(pin) + 4u) & 1u;
++	return rd(gpio_page(pin), 4u) & 1u;
+ }
+ 
+ static bool
+@@ -438,9 +442,8 @@ fts_thread(void *arg, wait_result_t result)
+ 	printf("SWEET FTS: starting in %u s\n", delay_s);
+ 	fts_wait(delay_s * 1000u);
+ 	ft.gcc = ml_io_map(FTS_GCC_PA, FTS_GCC_SIZE);
+-	ft.tlmm = ml_io_map(FTS_TLMM_PA, FTS_TLMM_SIZE);
+ 	ft.se = ml_io_map(FTS_SE_PA, 0x4000);
+-	if (!ft.gcc || !ft.tlmm || !ft.se || !fts_bringup()) {
++	if (!ft.gcc || !ft.se || !fts_bringup()) {
+ 		printf("SWEET FTS: bring-up failed; touch off\n");
+ 		thread_terminate(current_thread());
+ 		return;
