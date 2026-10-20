@@ -474,7 +474,7 @@ static void pull_log(void)
 		int len = (int)(j - i);
 		/* string literals only: a pointer table would need relocation */
 		int match = has(l, len, "SWEET FTS") || has(l, len, "SWEET KEYS") ||
-			    has(l, len, "SWEET HID: key") || has(l, len, "SWEET USB") || has(l, len, "panic");
+			    has(l, len, "SWEET HID") || has(l, len, "SWEET USB") || has(l, len, "panic");
 		for (uint32_t p = i; match && p < j && nrows < 600; p += cols) {
 			starts[nrows] = p;
 			lens[nrows++] = (int)((j - p) < (uint32_t)cols ? j - p : (uint32_t)cols);
