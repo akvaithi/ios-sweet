@@ -1,0 +1,16 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index 56e08c0..82ce882 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -184,6 +184,11 @@ fts_clocks(void)
+ 	wr(ft.gcc, FTS_GCC_VOTE, rd(ft.gcc, FTS_GCC_VOTE) | FTS_GCC_VOTE_BITS);
+ 	const uint32_t branches[] = {0x17004, 0x17008, 0x23000, 0x23008, 0x1700c};
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		/* HW_CTL (bit 1, gcc-lito hwcg on s_ahb): hardware gates it when idle,
++		 * so CLK_OFF may read 1; Linux's clk-branch skips the halt check too. */
++		if (rd(ft.gcc, branches[i]) & 2u) {
++			continue;
++		}
+ 		if (!wait_clear(ft.gcc, branches[i], 1u << 31)) {
+ 			printf("SWEET FTS: GCC branch %#x stays off (%#x)\n", branches[i],
+ 			    rd(ft.gcc, branches[i]));
