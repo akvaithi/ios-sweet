@@ -1,0 +1,53 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index 82ce882..e773839 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -432,7 +432,9 @@ fts_bringup(void)
+ 	if (fts_write(pre, sizeof(pre)) || fts_write(scan, sizeof(scan))) {
+ 		return false;
+ 	}
+-	printf("SWEET FTS: sensing on\n");
++	uint8_t icr = 0;
++	(void)fts_hw_read(0x2000002du, &icr, 1);
++	printf("SWEET FTS: sensing on (ICR=%#x irq-line=%u)\n", icr, gpio_get(GPIO_IRQ));
+ 	return true;
+ }
+ 
+@@ -453,8 +455,19 @@ fts_thread(void *arg, wait_result_t result)
+ 		thread_terminate(current_thread());
+ 		return;
+ 	}
+-	unsigned errors = 0;
++	unsigned errors = 0, reads = 0, nonzero = 0, irqlow = 0, logged = 0;
++	uint64_t next_report = mach_absolute_time();
+ 	for (;;) {
++		uint64_t now = mach_absolute_time();
++		if (now >= next_report) {	/* bring-up statistics every ~10 s */
++			printf("SWEET FTS: reads=%u events=%u irq-low=%u down=%#x\n", reads, nonzero, irqlow, ft.down);
++			uint64_t ten;
++			nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &ten);
++			next_report = now + ten;
++		}
++		if (!gpio_get(GPIO_IRQ)) {
++			irqlow++;
++		}
+ 		/* IRQ line low = events pending; still poll every 100 ms in case it is not wired as expected. */
+ 		uint8_t ev[8];
+ 		for (unsigned n = 0; n < 32 && (!gpio_get(GPIO_IRQ) || n == 0); ++n) {
+@@ -464,9 +477,16 @@ fts_thread(void *arg, wait_result_t result)
+ 				}
+ 				break;
+ 			}
++			reads++;
+ 			if (ev[0] == 0 || ev[0] == 0xff) {
+ 				break;
+ 			}
++			nonzero++;
++			if (logged < 40) {
++				logged++;
++				printf("SWEET FTS: ev %02x %02x %02x %02x %02x %02x %02x %02x\n",
++				    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
++			}
+ 			fts_handle(ev);
+ 		}
+ 		if (ft.dead) {
