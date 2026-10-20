@@ -1,0 +1,522 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index fe43a3b..033edd9 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_fts.c			standard
++bsd/dev/sweet_touchcore.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index 12bb1bd..62a4ebc 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -27,6 +27,8 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
++#include "sweet_touchcore.h"
++
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+@@ -363,6 +365,104 @@ fts_event(uint8_t ev[8])
+ 	return fts_read(&cmd, 1, ev, 8);
+ }
+ 
++/*
++ * Frame path (heatmap fallback, after UniXNU's THP model): the FTM5 keeps
++ * its mutual-sense frames in a "framebuffer" read with 0xA7 + 16-bit
++ * address + one dummy byte. Data blocks (system info, ...) are requested
++ * with FTS_CMD_SYSTEM LOAD_DATA and are ready once the 4-byte header at
++ * address 0 (0xA5, type, 16-bit counter) changes (ftsCore.c requestSyncFrame).
++ */
++#define FTS_CMD_FB_R     0xa7u
++#define FTS_CMD_SYS      0xa4u
++#define SYS_LOAD_DATA    0x06u
++#define LOAD_SYS_INFO    0x01u
++
++static struct stc_core fts_core;	/* ~70 KiB: never on a 16 KiB kernel stack */
++static int16_t fts_frame[STC_MAX_NODES];
++static uint8_t fts_fb_buf[STC_MAX_NODES * 2];
++
++static struct {
++	unsigned tx, rx;
++	uint16_t raw, stren, base;
++} fsys;
++
++static int
++fts_fb_read(uint16_t addr, uint8_t *out, unsigned n)
++{
++	uint8_t rx[256];
++	while (n) {
++		unsigned chunk = n > 200 ? 200 : n;
++		const uint8_t cmd[3] = {FTS_CMD_FB_R, (uint8_t)(addr >> 8), (uint8_t)addr};
++		int err = fts_xfer(cmd, sizeof(cmd), rx, 3u + 1u + chunk);
++		if (err) {
++			return err;
++		}
++		bcopy(rx + 4, out, chunk);
++		out += chunk;
++		addr = (uint16_t)(addr + chunk);
++		n -= chunk;
++	}
++	return 0;
++}
++
++static int
++fts_load_data(uint8_t type)
++{
++	uint8_t h[4];
++	if (fts_fb_read(0, h, sizeof(h))) {
++		return EIO;
++	}
++	unsigned count = h[2] | (h[3] << 8);
++	const uint8_t pre[7] = {FTS_CMD_HW_W, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00};
++	const uint8_t req[3] = {FTS_CMD_SYS, SYS_LOAD_DATA, type};
++	if (fts_write(pre, sizeof(pre)) || fts_write(req, sizeof(req))) {
++		return EIO;
++	}
++	for (unsigned i = 0; i < 100; ++i) {
++		fts_wait(5);
++		if (!fts_fb_read(0, h, sizeof(h)) && h[0] == 0xa5 && h[1] == type &&
++		    (unsigned)(h[2] | (h[3] << 8)) != count) {
++			return 0;
++		}
++	}
++	printf("SWEET FTS: load data %#x timed out (header %02x %02x %02x %02x)\n", type, h[0], h[1], h[2], h[3]);
++	return ETIMEDOUT;
++}
++
++static bool
++fts_sysinfo(void)
++{
++	uint8_t d[216];
++	if (fts_load_data(LOAD_SYS_INFO) || fts_fb_read(0, d, sizeof(d))) {
++		return false;
++	}
++	if (d[0] != 0xa5 || d[1] != LOAD_SYS_INFO) {
++		printf("SWEET FTS: bad system info header %02x %02x\n", d[0], d[1]);
++		return false;
++	}
++	/* ftsCore.c readSysInfo field order: scrTxLen 83, scrRxLen 84, msTch raw/filter/strength/baseline 135.. */
++	fsys.tx = d[83];
++	fsys.rx = d[84];
++	fsys.raw = (uint16_t)(d[135] | (d[136] << 8));
++	fsys.stren = (uint16_t)(d[139] | (d[140] << 8));
++	fsys.base = (uint16_t)(d[141] | (d[142] << 8));
++	printf("SWEET FTS: sysinfo fw=%02x%02x cfg=%02x%02x res=%ux%u tx=%u rx=%u raw=%#x stren=%#x base=%#x\n",
++	    d[17], d[16], d[21], d[20], d[79] | (d[80] << 8), d[81] | (d[82] << 8),
++	    fsys.tx, fsys.rx, fsys.raw, fsys.stren, fsys.base);
++	return fsys.tx && fsys.rx && fsys.tx * fsys.rx <= STC_MAX_NODES;
++}
++
++static int
++fts_read_frame(uint16_t addr)
++{
++	unsigned nodes = fsys.tx * fsys.rx;
++	int err = fts_fb_read(addr, fts_fb_buf, nodes * 2u);
++	for (unsigned i = 0; !err && i < nodes; ++i) {
++		fts_frame[i] = (int16_t)(fts_fb_buf[2 * i] | (fts_fb_buf[2 * i + 1] << 8));
++	}
++	return err;
++}
++
+ static void
+ fts_handle(const uint8_t ev[8])
+ {
+@@ -479,6 +579,50 @@ fts_thread(void *arg, wait_result_t result)
+ 	}
+ 	unsigned errors = 0, reads = 0, nonzero = 0, irqlow = 0, logged = 0;
+ 	uint64_t next_report = mach_absolute_time();
++	/*
++	 * Frames (boot-arg sweetftshost): 0 off, 1 log frame statistics,
++	 * 2 also compute touches on the host from them. sweetftsframe=1 uses
++	 * raw frames (host baseline) instead of the IC's strength frames.
++	 */
++	unsigned host = 1, use_raw = 0, orient = 0, lines = 0;
++	struct stc_config cfg = {0};
++	(void)PE_parse_boot_argn("sweetftshost", &host, sizeof(host));
++	(void)PE_parse_boot_argn("sweetftsframe", &use_raw, sizeof(use_raw));
++	(void)PE_parse_boot_argn("sweetftsorient", &orient, sizeof(orient));
++	if (host && !fts_sysinfo()) {
++		printf("SWEET FTS: no system info; frame path off\n");
++		host = 0;
++	}
++	uint16_t faddr = use_raw ? fsys.raw : fsys.stren;
++	if (host) {
++		cfg.rows = (int)fsys.tx;
++		cfg.cols = (int)fsys.rx;
++		cfg.width = 1080;
++		cfg.height = 2400;
++		cfg.swap = (cfg.rows < cfg.cols) ^ ((orient >> 2) & 1);	/* more lines along the long axis */
++		cfg.flip_x = orient & 1;
++		cfg.flip_y = (orient >> 1) & 1;
++		cfg.noise = 60;
++		cfg.down = 200;
++		cfg.up = 120;
++		cfg.palm_nodes = 40;
++		cfg.track_radius = 300;
++		(void)PE_parse_boot_argn("sweetftsnoise", &cfg.noise, sizeof(cfg.noise));
++		(void)PE_parse_boot_argn("sweetftsdown", &cfg.down, sizeof(cfg.down));
++		(void)PE_parse_boot_argn("sweetftsup", &cfg.up, sizeof(cfg.up));
++		stc_reset(&fts_core);
++		if (!fts_read_frame(faddr)) {
++			int lo = 32767, hi = -32768;
++			for (int i = 0; i < cfg.rows * cfg.cols; ++i) {
++				lo = fts_frame[i] < lo ? fts_frame[i] : lo;
++				hi = fts_frame[i] > hi ? fts_frame[i] : hi;
++			}
++			printf("SWEET FTS: %s frame %ux%u min=%d max=%d swap=%d flip=%d/%d mode=%u\n",
++			    use_raw ? "raw" : "strength", cfg.rows, cfg.cols, lo, hi, cfg.swap, cfg.flip_x, cfg.flip_y, host);
++		}
++	}
++	unsigned prev = 0;	/* slots down last frame */
++	int px[STC_SLOTS], py[STC_SLOTS];
+ 	for (;;) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now >= next_report) {	/* bring-up statistics every ~10 s */
+@@ -511,6 +655,30 @@ fts_thread(void *arg, wait_result_t result)
+ 			}
+ 			fts_handle(ev);
+ 		}
++		if (host && !ft.dead && !fts_read_frame(faddr)) {
++			struct stc_contact c[STC_SLOTS];
++			int n = stc_process(&fts_core, &cfg, fts_frame, c, STC_SLOTS);
++			if (n >= 0 && fts_core.max_delta >= cfg.noise && lines < 400 && (lines++ % 4) == 0) {
++				int i = fts_core.max_index;
++				printf("SWEET FTS: frame peak %d at r%d c%d, contacts %d\n", fts_core.max_delta,
++				    i / cfg.cols, i % cfg.cols, n);
++			}
++			if (host >= 2 && n >= 0) {
++				unsigned now_down = 0;
++				for (int k = 0; k < n; ++k) {
++					now_down |= 1u << c[k].slot;
++					px[c[k].slot] = c[k].x;
++					py[c[k].slot] = c[k].y;
++					sweet_hid_touch(c[k].slot, 1, c[k].x, c[k].y);
++				}
++				for (int k = 0; k < STC_SLOTS; ++k) {
++					if ((prev & ~now_down) & (1u << k)) {
++						sweet_hid_touch(k, 0, px[k], py[k]);
++					}
++				}
++				prev = now_down;
++			}
++		}
+ 		if (ft.dead) {
+ 			printf("SWEET FTS: SPI engine dead; touch off\n");
+ 			break;
+diff --git a/bsd/dev/sweet_touchcore.c b/bsd/dev/sweet_touchcore.c
+new file mode 100644
+index 0000000..b02b971
+--- /dev/null
++++ b/bsd/dev/sweet_touchcore.c
+@@ -0,0 +1,239 @@
++/*
++ * Host-side touch processing; see sweet_touchcore.h.
++ * Modeled on UniXNU NativeNovatekTouch/NvtTouchCore.c (Apache-2.0).
++ */
++#include "sweet_touchcore.h"
++
++#if defined(KERNEL)
++#include <sys/systm.h>		/* memset, memcpy */
++#else
++#include <string.h>
++#endif
++
++void
++stc_reset(struct stc_core *core)
++{
++	memset(core, 0, sizeof(*core));
++}
++
++static void
++sort_i16(int16_t *v, int n)
++{
++	for (int i = 1; i < n; ++i) {
++		int16_t x = v[i];
++		int j = i;
++		while (j > 0 && v[j - 1] > x) {
++			v[j] = v[j - 1];
++			--j;
++		}
++		v[j] = x;
++	}
++}
++
++/* Per-node median of the startup frames: the untouched panel. */
++static void
++form_reference(struct stc_core *core, int nodes)
++{
++	int16_t column[STC_STARTUP];
++	for (int n = 0; n < nodes; ++n) {
++		for (int s = 0; s < STC_STARTUP; ++s) {
++			column[s] = core->startup[s][n];
++		}
++		sort_i16(column, STC_STARTUP);
++		core->reference[n] = (int16_t)(((int)column[STC_STARTUP / 2 - 1] + (int)column[STC_STARTUP / 2]) / 2);
++	}
++	core->have_reference = 1;
++}
++
++struct peak { int index, value; };
++struct blob { long sum_w, sum_r, sum_c; int peak, area; };
++
++/* Node (row, col) -> output pixel, centre of the node, honouring orientation. */
++static void
++node_to_pixel(const struct stc_config *cfg, long r_x16, long c_x16, int *x, int *y)
++{
++	/* r_x16, c_x16: fractional node coordinates times 16 */
++	long along_rows = cfg->swap ? cfg->width : cfg->height;
++	long along_cols = cfg->swap ? cfg->height : cfg->width;
++	long pr = (r_x16 + 8) * along_rows / (16L * cfg->rows);
++	long pc = (c_x16 + 8) * along_cols / (16L * cfg->cols);
++	long px = cfg->swap ? pr : pc;
++	long py = cfg->swap ? pc : pr;
++	if (cfg->flip_x) {
++		px = cfg->width - 1 - px;
++	}
++	if (cfg->flip_y) {
++		py = cfg->height - 1 - py;
++	}
++	*x = px < 0 ? 0 : (px >= cfg->width ? cfg->width - 1 : (int)px);
++	*y = py < 0 ? 0 : (py >= cfg->height ? cfg->height - 1 : (int)py);
++}
++
++int
++stc_process(struct stc_core *core, const struct stc_config *cfg, const int16_t *frame,
++    struct stc_contact *out, int max)
++{
++	const int rows = cfg->rows, cols = cfg->cols, nodes = rows * cols;
++	if (nodes <= 0 || nodes > STC_MAX_NODES) {
++		return 0;
++	}
++	if (!core->have_reference) {
++		memcpy(core->startup[core->startup_count++], frame, (size_t)nodes * sizeof(int16_t));
++		if (core->startup_count == STC_STARTUP) {
++			form_reference(core, nodes);
++		}
++		return -1;
++	}
++
++	int *delta = core->delta, *label = core->label;
++	core->max_delta = 0;
++	core->max_index = -1;
++	for (int i = 0; i < nodes; ++i) {
++		delta[i] = (int)frame[i] - (int)core->reference[i];
++		label[i] = -1;
++		if (delta[i] > core->max_delta) {
++			core->max_delta = delta[i];
++			core->max_index = i;
++		}
++	}
++
++	/* Steepest ascent: each node above the noise floor flows to its local maximum. */
++	struct peak peaks[STC_MAX_PEAKS];
++	int npeaks = 0;
++	for (int i = 0; i < nodes; ++i) {
++		if (delta[i] < cfg->noise) {
++			continue;
++		}
++		int cur = i;
++		for (;;) {
++			int best = cur, bv = delta[cur], r = cur / cols, c = cur % cols;
++			for (int dr = -1; dr <= 1; ++dr) {
++				for (int dc = -1; dc <= 1; ++dc) {
++					int rr = r + dr, cc = c + dc;
++					if ((!dr && !dc) || rr < 0 || rr >= rows || cc < 0 || cc >= cols) {
++						continue;
++					}
++					int n = rr * cols + cc;
++					if (delta[n] > bv || (delta[n] == bv && n > best)) {
++						bv = delta[n];
++						best = n;
++					}
++				}
++			}
++			if (best == cur) {
++				break;
++			}
++			cur = best;
++		}
++		int found = -1;
++		for (int p = 0; p < npeaks; ++p) {
++			if (peaks[p].index == cur) {
++				found = p;
++				break;
++			}
++		}
++		if (found < 0) {
++			if (npeaks == STC_MAX_PEAKS) {
++				continue;
++			}
++			peaks[npeaks].index = cur;
++			peaks[npeaks].value = delta[cur];
++			found = npeaks++;
++		}
++		label[i] = found;
++	}
++
++	struct blob blobs[STC_MAX_PEAKS];
++	memset(blobs, 0, sizeof(blobs));
++	for (int p = 0; p < npeaks; ++p) {
++		blobs[p].peak = peaks[p].value;
++	}
++	for (int i = 0; i < nodes; ++i) {
++		if (label[i] < 0) {
++			continue;
++		}
++		struct blob *b = &blobs[label[i]];
++		long w = delta[i] - cfg->noise / 2;
++		if (w <= 0) {
++			continue;
++		}
++		b->sum_w += w;
++		b->sum_r += w * (i / cols) * 16;
++		b->sum_c += w * (i % cols) * 16;
++		b->area++;
++	}
++
++	struct stc_contact found[STC_MAX_PEAKS];
++	int nfound = 0;
++	for (int p = 0; p < npeaks; ++p) {
++		struct blob *b = &blobs[p];
++		if (!b->sum_w || b->area >= cfg->palm_nodes) {
++			continue;	/* empty, or palm-sized */
++		}
++		int x, y;
++		node_to_pixel(cfg, (b->sum_r + b->sum_w / 2) / b->sum_w, (b->sum_c + b->sum_w / 2) / b->sum_w, &x, &y);
++		found[nfound].slot = -1;
++		found[nfound].x = x;
++		found[nfound].y = y;
++		found[nfound].peak = b->peak;
++		found[nfound].area = b->area;
++		nfound++;
++	}
++
++	/* Keep tracked slots: nearest contact within the radius, above the up threshold. */
++	int used[STC_MAX_PEAKS] = {0};
++	long radius2 = (long)cfg->track_radius * cfg->track_radius;
++	for (int s = 0; s < STC_SLOTS; ++s) {
++		struct stc_slot *slot = &core->slots[s];
++		if (!slot->active) {
++			continue;
++		}
++		int best = -1;
++		long bd = 0;
++		for (int c = 0; c < nfound; ++c) {
++			if (used[c] || found[c].peak < cfg->up) {
++				continue;
++			}
++			long dx = found[c].x - slot->x, dy = found[c].y - slot->y, d = dx * dx + dy * dy;
++			if (d <= radius2 && (best < 0 || d < bd)) {
++				best = c;
++				bd = d;
++			}
++		}
++		if (best < 0) {
++			slot->active = 0;
++			continue;
++		}
++		used[best] = 1;
++		found[best].slot = s;
++		slot->x = found[best].x;
++		slot->y = found[best].y;
++		slot->age++;
++	}
++	/* New contacts need the down threshold. */
++	for (int c = 0; c < nfound; ++c) {
++		if (used[c] || found[c].peak < cfg->down) {
++			continue;
++		}
++		for (int s = 0; s < STC_SLOTS; ++s) {
++			if (core->slots[s].active) {
++				continue;
++			}
++			core->slots[s].active = 1;
++			core->slots[s].age = 1;
++			core->slots[s].x = found[c].x;
++			core->slots[s].y = found[c].y;
++			found[c].slot = s;
++			used[c] = 1;
++			break;
++		}
++	}
++	int count = 0;
++	for (int c = 0; c < nfound && count < max; ++c) {
++		if (found[c].slot < 0 || core->slots[found[c].slot].age < 2) {
++			continue;	/* report from the second frame of a slot on */
++		}
++		out[count++] = found[c];
++	}
++	return count;
++}
+diff --git a/bsd/dev/sweet_touchcore.h b/bsd/dev/sweet_touchcore.h
+new file mode 100644
+index 0000000..e1d71af
+--- /dev/null
++++ b/bsd/dev/sweet_touchcore.h
+@@ -0,0 +1,59 @@
++/*
++ * Host-side touch processing for a capacitive node matrix (barbet's ST
++ * FTM5 mutual-sense strength frames): baseline, delta, blobs, centroids,
++ * tracking. Pure C: no allocation, no I/O; host-tested.
++ *
++ * Modeled on UniXNU's NvtTouchCore (Apache-2.0, github.com/UniXNU/
++ * NativeNovatekTouch): steepest-ascent labelling, palm rejection,
++ * greedy nearest tracking with down/up hysteresis. Generalized to a
++ * runtime grid and a uniform node pitch.
++ */
++#ifndef SWEET_TOUCHCORE_H
++#define SWEET_TOUCHCORE_H
++#include <stdint.h>
++
++#define STC_MAX_NODES   2048
++#define STC_STARTUP     16
++#define STC_SLOTS       10
++#define STC_MAX_PEAKS   16
++
++struct stc_config {
++	int rows, cols;		/* frame is rows x cols, row-major */
++	int width, height;	/* output pixel space (1080 x 2400) */
++	int swap;		/* 1: rows run along x instead of y */
++	int flip_x, flip_y;
++	int noise;		/* nodes below this delta are ignored */
++	int down, up;		/* peak needed to start / keep a contact */
++	int palm_nodes;		/* blobs this large are not reported */
++	int track_radius;	/* pixels a contact may move per frame */
++};
++
++struct stc_contact {
++	int slot, x, y, peak, area;
++};
++
++struct stc_slot {
++	int active, x, y, age;
++};
++
++struct stc_core {
++	int have_reference, startup_count;
++	int16_t startup[STC_STARTUP][STC_MAX_NODES];
++	int16_t reference[STC_MAX_NODES];
++	int delta[STC_MAX_NODES];
++	int label[STC_MAX_NODES];
++	struct stc_slot slots[STC_SLOTS];
++	/* last frame statistics, for bring-up logs */
++	int max_delta, max_index;
++};
++
++void stc_reset(struct stc_core *core);
++/*
++ * Process one frame. Returns the number of contacts written to out (only
++ * slots seen for two frames or more), or -1 while the baseline is still
++ * being collected. Contacts absent from the result are up.
++ */
++int stc_process(struct stc_core *core, const struct stc_config *cfg, const int16_t *frame,
++    struct stc_contact *out, int max);
++
++#endif
