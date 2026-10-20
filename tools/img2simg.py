@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Raw image -> Android sparse image (what AOSP img2simg does), for macOS
 where platform-tools ships no img2simg and fastboot refuses a 16 GiB raw file.
-All-zero 4 KiB blocks become DONT_CARE chunks.
+All-zero 4 KiB blocks become FILL chunks of 0 (written as zeros), never
+DONT_CARE: the partition keeps whatever it held before, so a DONT_CARE run
+inside a file (a zero page of /sbin/launchd) would come back as old Android
+data -- which is exactly what cs_invalid_page caught on the first boot.
 
 usage: img2simg.py RAW OUT.simg
 """
@@ -10,7 +13,7 @@ import struct
 import sys
 
 BLK = 4096
-MAGIC, RAW, DONT_CARE = 0xED26FF3A, 0xCAC1, 0xCAC3
+MAGIC, RAW, FILL = 0xED26FF3A, 0xCAC1, 0xCAC2
 ZERO = bytes(BLK)
 
 
@@ -23,7 +26,7 @@ def main():
     chunks = []	# (type, first block, count)
     with open(src, "rb") as f:
         for b in range(total):
-            kind = DONT_CARE if f.read(BLK) == ZERO else RAW
+            kind = FILL if f.read(BLK) == ZERO else RAW
             if chunks and chunks[-1][0] == kind:
                 chunks[-1][2] += 1
             else:
@@ -31,9 +34,11 @@ def main():
         with open(dst, "wb") as o:
             o.write(struct.pack("<IHHHHIIII", MAGIC, 1, 0, 28, 12, BLK, total, len(chunks), 0))
             for kind, first, n in chunks:
-                data = n * BLK if kind == RAW else 0
+                data = n * BLK if kind == RAW else 4
                 o.write(struct.pack("<HHII", kind, 0, n, 12 + data))
-                if kind == RAW:
+                if kind == FILL:
+                    o.write(struct.pack("<I", 0))
+                else:
                     f.seek(first * BLK)
                     for _ in range(n):
                         o.write(f.read(BLK))
