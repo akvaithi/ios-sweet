@@ -410,6 +410,83 @@ static void dump_ring(void)
 }
 #endif
 
+
+#ifdef LOGPULL
+/*
+ * Kernel console ring persisted at the end of userdata (xnu 0047,
+ * sweetlog=1): header block "SWEETLOG", then a 4 MiB ring. Read it with
+ * the shim's own (read-only) UFS path and show the lines that matter.
+ */
+#define PULL_BUF	0xc0000000UL	/* free 1 GiB bank, MMU off */
+#define PULL_RING	(4u << 20)
+
+static int has(const char *l, int n, const char *k)
+{
+	for (int i = 0; i < n; i++) {
+		int j = 0;
+		while (k[j] && i + j < n && l[i + j] == k[j])
+			j++;
+		if (!k[j])
+			return 1;
+	}
+	return 0;
+}
+
+static void pull_log(void)
+{
+	static int starts[600], lens[600];
+	con_skip();
+	if (!ufs_userdata_last) {
+		con_str("PULL", "no userdata partition");
+		return;
+	}
+	uint32_t base = (uint32_t)(ufs_userdata_last + 1 - 1025);
+	volatile uint8_t *buf = (volatile uint8_t *)PULL_BUF;
+	if (ufs_read(base, 1, (void *)buf)) {
+		con_str("PULL", "header read failed");
+		return;
+	}
+	if (buf[0] != 'S' || buf[1] != 'W' || buf[7] != 'G') {
+		con_str("PULL", "no SWEETLOG header");
+		return;
+	}
+	uint64_t total = 0;
+	for (int i = 0; i < 8; i++)
+		total |= (uint64_t)buf[16 + i] << (8 * i);
+	for (uint32_t b = 0; b < 1024; b += 64)
+		if (ufs_read(base + 1 + b, 64, (void *)(PULL_BUF + b * 4096)))
+			break;
+	uint32_t n = total < PULL_RING ? (uint32_t)total : PULL_RING;
+	uint32_t start = (uint32_t)((total - n) % PULL_RING);
+	/* linearize into the next 4 MiB */
+	volatile char *lin = (volatile char *)(PULL_BUF + PULL_RING);
+	for (uint32_t i = 0; i < n; i++)
+		lin[i] = buf[(start + i) % PULL_RING];
+	con_clear(0xff102010U);
+	con_scale(2);
+	con_hex2("LOG", "bytes=", (uint32_t)total, 0, 0);
+	int cols = con_cols(), nrows = 0;
+	for (uint32_t i = 0; i < n;) {
+		uint32_t j = i;
+		while (j < n && lin[j] != '\n')
+			j++;
+		const char *l = (const char *)lin + i;
+		int len = (int)(j - i);
+		/* string literals only: a pointer table would need relocation */
+		int match = has(l, len, "SWEET FTS") || has(l, len, "SWEET KEYS") ||
+			    has(l, len, "SWEET HID: key") || has(l, len, "SWEET USB") || has(l, len, "panic");
+		for (uint32_t p = i; match && p < j && nrows < 600; p += cols) {
+			starts[nrows] = p;
+			lens[nrows++] = (int)((j - p) < (uint32_t)cols ? j - p : (uint32_t)cols);
+		}
+		i = j + 1;
+	}
+	int show = con_rows() - 2;
+	for (int r = nrows > show ? nrows - show : 0; r < nrows; r++)
+		con_raw((const char *)lin + starts[r], lens[r]);
+}
+#endif
+
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
@@ -438,6 +515,11 @@ void shim_main(uint64_t dtb)
 	/* barbet: ABL leaves the UFS device Not Ready; the probe wakes it (SSU) for xnu. */
 	test_ufs();
 	con_skip();
+#ifdef LOGPULL
+	pull_log();
+	delay_ms(600000);
+	reset(20);
+#endif
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();

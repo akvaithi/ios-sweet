@@ -174,6 +174,14 @@ static const char *fs_type(uint32_t lba)
 }
 
 /* One line per GPT entry of at least 64 MiB: name, first LBA, size in MiB (4K blocks). */
+uint64_t ufs_userdata_first, ufs_userdata_last;	/* set by the GPT walk below */
+
+/* Exported for the log-pull mode: 64 blocks (256 KiB, one PRDT entry) at most per call. */
+uint32_t ufs_read(uint32_t lba, uint32_t count, void *buf)
+{
+	return read_blocks(lba, count, buf);
+}
+
 static void list_partitions(uint32_t entry_lba, uint32_t nent)
 {
 	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
@@ -193,6 +201,10 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 			name[c] = (ch >= 32 && ch < 127) ? ch : (ch ? '?' : 0);
 		}
 		name[16] = 0;
+		if (!__builtin_strcmp(name, "userdata")) {
+			ufs_userdata_first = first;
+			ufs_userdata_last = last;
+		}
 		if (((last - first + 1) >> 8) < 64)	/* keep the screen to the big ones */
 			continue;
 		con_hex2(name, "lba=", (uint32_t)first, "MiB=", (uint32_t)((last - first + 1) >> 8));
